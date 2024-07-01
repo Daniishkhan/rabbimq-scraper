@@ -9,12 +9,50 @@ import psycopg2
 from psycopg2.extras import Json
 import logging
 import atexit
+import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 load_dotenv()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def create_table_if_not_exists():
+    create_table_query = '''
+    CREATE TABLE IF NOT EXISTS website_analyses (
+        id SERIAL PRIMARY KEY,
+        url VARCHAR(255) NOT NULL,
+        analysis JSONB NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    '''
+    try:
+        with conn.cursor() as cur:
+            cur.execute(create_table_query)
+        conn.commit()
+        logging.info("Ensured website_analyses table exists")
+    except Exception as e:
+        logging.error(f"Error creating table: {e}")
+        conn.rollback()
+
+
+def connect_with_retry(max_retries=5, delay=5):
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to RabbitMQ (attempt {attempt + 1})...")
+            connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host=os.environ.get('RABBITMQ_HOST', 'rabbitmq'))
+            )
+            logger.info("Successfully connected to RabbitMQ")
+            return connection
+        except pika.exceptions.AMQPConnectionError as e:
+            logger.error(f"Failed to connect to RabbitMQ: {e}")
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(delay)
 
 # Database connection
 try:
@@ -25,6 +63,7 @@ try:
         host=os.getenv("DB_HOST"),
         port=os.getenv("DB_PORT", "5432")
     )
+    create_table_if_not_exists()
     logging.info("Successfully connected to the database")
 except Exception as e:
     logging.error(f"Error connecting to the database: {e}")
@@ -44,6 +83,7 @@ def store_result(url, analysis):
     logging.info(f"Attempting to store result for {url}")
     try:
         with conn.cursor() as cur:
+            logging.info(f"Inserting data: URL={url}, Analysis={analysis}")
             cur.execute(
                 "INSERT INTO website_analyses (url, analysis) VALUES (%s, %s)",
                 (url, Json(analysis))
@@ -53,6 +93,7 @@ def store_result(url, analysis):
     except Exception as e:
         logging.error(f"Error storing result for {url}: {e}")
         conn.rollback()
+
 
 def process_screenshot(ch, method, properties, body):
     url = properties.headers.get('url', 'Unknown URL')
@@ -100,7 +141,7 @@ def process_screenshot(ch, method, properties, body):
 
 def main():
     try:
-        connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+        connection = connect_with_retry()
         channel = connection.channel()
 
         channel.queue_declare(queue='screenshot_queue', durable=False)
